@@ -380,7 +380,7 @@ case "$1" in
           exit 0
           ;;
         fail)
-          printf '{{"ok":false,"checksRun":1,"checksSkipped":0,"findings":[{{"checkId":"codex/managed-app-server","severity":"error","message":"Managed Codex app-server version mismatch: expected 0.147.0, detected 0.146.0.","path":"/candidate/codex"}}]}}\n'
+          printf '{{"ok":false,"checksRun":1,"checksSkipped":0,"findings":[{{"checkId":"codex/managed-app-server","severity":"error","message":"Managed Codex app-server version mismatch: expected 0.147.0, detected 0.146.0.","path":"/candidate/codex","fixHint":"Repair or reinstall the staged OpenClaw package before cutover."}}]}}\n'
           exit 1
           ;;
         unsupported)
@@ -3488,6 +3488,15 @@ fn upgrade_simulate_preserves_passed_outcome_when_cleanup_fails() {
 
 #[test]
 fn upgrade_rolls_back_runtime_when_service_restart_fails() {
+    assert_upgrade_rollback_restart_failure(false);
+}
+
+#[test]
+fn candidate_failure_reports_failed_service_recovery() {
+    assert_upgrade_rollback_restart_failure(true);
+}
+
+fn assert_upgrade_rollback_restart_failure(candidate_failure: bool) {
     let root = TestDir::new("upgrade-service-rollback");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -3568,6 +3577,9 @@ fn upgrade_rolls_back_runtime_when_service_restart_fails() {
         ),
     );
 
+    if candidate_failure {
+        env.insert("OCM_TEST_CODEX_PREFLIGHT".to_string(), "fail".to_string());
+    }
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--version", "2026.3.25"]);
     assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
     let output = stdout(&upgrade);
@@ -3584,6 +3596,19 @@ fn upgrade_rolls_back_runtime_when_service_restart_fails() {
         "{output}"
     );
     assert!(output.contains("snapshot="), "{output}");
+    if candidate_failure {
+        assert!(
+            output.contains("expected 0.147.0, detected 0.146.0"),
+            "{output}"
+        );
+        let recovery = output.split("OCM recovery result:").nth(1).unwrap();
+        assert!(recovery.contains("was retained"), "{output}");
+        assert!(
+            recovery.contains("resolve the recovery or cleanup errors before retrying"),
+            "{output}"
+        );
+        assert!(!recovery.contains("Repair or reinstall"), "{output}");
+    }
 
     let runtime = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
     assert!(runtime.status.success(), "{}", stderr(&runtime));
@@ -6981,4 +7006,467 @@ fn managed_codex_candidate_failure_rolls_back_repaired_state_before_publication(
         .unwrap();
     assert!(doctor < candidate, "{command_log}");
     assert!(!command_log.contains("update finalize"), "{command_log}");
+}
+
+fn assert_candidate_configuration_diagnostics(stderr_text: &str) -> String {
+    let root = TestDir::new("ocm125-config-diagnostic");
+    let (cwd, mut env, env_root) = setup_named_runtime_candidate_fixture(&root);
+    let finding = serde_json::json!({
+        "ok": false, "checksRun": 1, "checksSkipped": 0,
+        "findings": [{
+            "checkId": "core/doctor/final-config-validation",
+            "severity": "error",
+            "message": "Invalid target configuration; openclaw update finalize failed is child diagnostic text",
+            "path": "agents.defaults.model",
+            "fixHint": "Repair the target configuration and rerun validation."
+        }]
+    }).to_string();
+    let noise = if stderr_text.is_empty() {
+        String::new()
+    } else {
+        format!("printf '%s\\n' '{stderr_text}' >&2\n")
+    };
+    let intercept = format!(
+        "#!/bin/sh\nif [ \"$1\" = doctor ] && [ \"$2\" = --lint ]; then\n{noise}printf '%s\\n' '{finding}'\nexit 1\nfi\n"
+    );
+    let target = recording_openclaw_script("new-openclaw").replacen("#!/bin/sh\n", &intercept, 1);
+    write_executable_script(&root.child("new-openclaw"), &target);
+    env.insert("OCM_TEST_CODEX_PREFLIGHT".to_string(), "pass".to_string());
+    let before = fs::read(env_root.join(".openclaw/openclaw.json")).unwrap();
+    let out = run_ocm(
+        &cwd,
+        &env,
+        &["upgrade", "demo", "--runtime", "new-local", "--json"],
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let receipt: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let note = receipt["note"].as_str().unwrap();
+    assert_eq!(receipt["outcome"], "rolled-back");
+    assert!(
+        note.contains("Correct the reported target-configuration finding"),
+        "{note}"
+    );
+    assert!(!note.contains("Repair or reinstall"), "{note}");
+    let fields_visible = note.contains("core/doctor/final-config-validation")
+        && note.contains("agents.defaults.model")
+        && note.contains("Repair the target configuration and rerun validation.");
+    assert!(fields_visible, "{note}");
+    assert_eq!(
+        before,
+        fs::read(env_root.join(".openclaw/openclaw.json")).unwrap()
+    );
+    let retained = root.child("new-openclaw").exists()
+        && root.child("ocm-home/runtimes/new-local.json").exists();
+    assert!(retained);
+    let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
+    assert!(history.status.success(), "{}", stderr(&history));
+    let history_text = stdout(&history);
+    let history: Value = serde_json::from_str(&history_text).unwrap();
+    assert_eq!(history[0]["migration"]["status"], "validated");
+    assert_eq!(history[0]["finalization"]["status"], "not-run");
+    assert!(!history_text.contains("Invalid target configuration"));
+    assert!(!history_text.contains("Repair the target configuration"));
+    if stderr_text.is_empty() {
+        let pretty = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "upgrade",
+                "demo",
+                "--runtime",
+                "new-local",
+                "--color",
+                "always",
+            ],
+        );
+        let output = stdout(&pretty);
+        assert!(!pretty.status.success(), "{output}");
+        assert!(output.contains("Target"), "{output}");
+        assert!(!output.contains("Now using"), "{output}");
+        assert!(output.contains("OCM recovery result:"), "{output}");
+    }
+    note.to_string()
+}
+
+#[test]
+fn candidate_configuration_diagnostics_identify_the_repair_owner() {
+    assert_candidate_configuration_diagnostics("");
+}
+
+#[test]
+fn candidate_diagnostics_keep_findings_when_stderr_is_present() {
+    assert_candidate_configuration_diagnostics("Warning: optional diagnostic hook unavailable");
+}
+
+#[test]
+fn candidate_recovery_guidance_survives_authorization_redaction() {
+    let note = assert_candidate_configuration_diagnostics(
+        "Authorization: Bearer diagnostic-private-token",
+    );
+    assert!(note.contains("authorization:<redacted>"), "{note}");
+    assert!(!note.contains("diagnostic-private-token"), "{note}");
+    assert!(note.contains("OCM recovery result:"), "{note}");
+    assert!(
+        note.contains("Candidate runtime \"new-local\" was retained"),
+        "{note}"
+    );
+}
+
+#[test]
+fn candidate_failure_without_rollback_reports_retained_repairs() {
+    let root = TestDir::new("ocm125-no-rollback");
+    let (cwd, mut env, env_root) = setup_named_runtime_candidate_fixture(&root);
+    enable_migratable_target_config(&env_root, &mut env);
+    let migrating_target = recording_openclaw_script("new-openclaw").replacen(
+        "touch \"$home/.openclaw/config-repaired\"",
+        "printf '{}\\n' > \"$home/.openclaw/openclaw.json\"\n      touch \"$home/.openclaw/config-repaired\"",
+        1,
+    );
+    write_executable_script(&root.child("new-openclaw"), &migrating_target);
+    env.insert("OCM_TEST_CODEX_PREFLIGHT".to_string(), "fail".to_string());
+    let config = env_root.join(".openclaw/openclaw.json");
+    let before = fs::read(&config).unwrap();
+    let out = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "upgrade",
+            "demo",
+            "--runtime",
+            "new-local",
+            "--no-rollback",
+            "--json",
+        ],
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let receipt: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let note = receipt["note"].as_str().unwrap();
+    assert_eq!(receipt["rollback"], "disabled");
+    assert_ne!(before, fs::read(&config).unwrap());
+    assert!(env_root.join(".openclaw/config-repaired").exists());
+    assert!(
+        !note.contains("the source environment was not changed"),
+        "{note}"
+    );
+    assert!(
+        note.contains("changes were retained because rollback was disabled"),
+        "{note}"
+    );
+    assert!(note.contains("runtime \"old-local\""), "{note}");
+    assert!(
+        note.contains("expected 0.147.0, detected 0.146.0"),
+        "{note}"
+    );
+    let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let env_json: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    assert_eq!(env_json["defaultRuntime"], "old-local");
+}
+
+#[test]
+fn candidate_failure_reports_removed_official_runtime() {
+    assert_candidate_failure_reports_new_runtime_cleanup(false);
+}
+
+#[test]
+fn candidate_failure_reports_incomplete_official_runtime_cleanup() {
+    assert_candidate_failure_reports_new_runtime_cleanup(true);
+}
+
+fn assert_candidate_failure_reports_new_runtime_cleanup(incomplete: bool) {
+    let root = TestDir::new("ocm125-official-discard");
+    let (cwd, mut env, env_root) = setup_named_runtime_candidate_fixture(&root);
+    install_fake_node_and_npm(&root, &mut env, "22.22.3");
+    let mut script = recording_openclaw_script("2026.8.2");
+    if incomplete {
+        // Missing registration must not be mistaken for complete cleanup: the
+        // installed candidate bytes remain after rollback's early return.
+        let candidate_meta = root.child("ocm-home/runtimes/2026.8.2.json");
+        script = script.replacen(
+            "case \"${OCM_TEST_CODEX_PREFLIGHT:-unsupported}\" in",
+            &format!(
+                "rm -f '{}'\n      case \"${{OCM_TEST_CODEX_PREFLIGHT:-unsupported}}\" in",
+                candidate_meta.display()
+            ),
+            1,
+        );
+    }
+    let tarball = openclaw_package_tarball(&script, "2026.8.2");
+    let integrity = sha512_integrity(&tarball);
+    let package_server = TestHttpServer::serve_bytes_sequence(
+        "/openclaw-2026.8.2.tgz",
+        "application/octet-stream",
+        vec![tarball; 3],
+    );
+    let packument = serde_json::json!({
+        "dist-tags": {"latest": "2026.8.2"},
+        "versions": {"2026.8.2": {
+            "version": "2026.8.2",
+            "dist": {"tarball": package_server.url(), "integrity": integrity}
+        }},
+        "time": {"2026.8.2": "2026-08-02T00:00:00.000Z"}
+    })
+    .to_string();
+    let registry = TestHttpServer::serve_bytes_sequence(
+        "/openclaw",
+        "application/json",
+        vec![packument.into_bytes(); 8],
+    );
+    env.insert(
+        "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
+        registry.url(),
+    );
+    env.insert("OCM_TEST_CODEX_PREFLIGHT".to_string(), "fail".to_string());
+    let before = fs::read(env_root.join(".openclaw/openclaw.json")).unwrap();
+    let out = run_ocm(
+        &cwd,
+        &env,
+        &["upgrade", "demo", "--version", "2026.8.2", "--json"],
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let receipt: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let note = receipt["note"].as_str().unwrap();
+    assert_eq!(receipt["outcome"], "rolled-back", "{note}");
+    assert!(
+        note.contains("expected 0.147.0, detected 0.146.0"),
+        "{note}"
+    );
+    assert!(note.contains("candidate hint before recovery: Repair or reinstall the staged OpenClaw package before cutover."), "{note}");
+    let recovery = note.rsplit("OCM recovery result:").next().unwrap();
+    assert!(!recovery.contains("Repair or reinstall"), "{note}");
+    if incomplete {
+        assert!(
+            recovery.contains("restoration or cleanup could not be confirmed"),
+            "{note}"
+        );
+        assert!(
+            recovery.contains("resolve the recovery or cleanup errors before retrying"),
+            "{note}"
+        );
+        assert!(!recovery.contains("was removed"), "{note}");
+    } else {
+        assert!(recovery.contains("was removed during rollback"), "{note}");
+        assert!(recovery.contains("prepare a fresh candidate"), "{note}");
+    }
+    let target_name = receipt["bindingName"].as_str().unwrap();
+    let meta = ocm::store::runtime_meta_path(target_name, &env, &cwd).unwrap();
+    let install = ocm::store::runtime_install_root(target_name, &env, &cwd).unwrap();
+    assert!(!meta.exists(), "{}", meta.display());
+    assert_eq!(install.exists(), incomplete, "{}", install.display());
+    assert_eq!(
+        before,
+        fs::read(env_root.join(".openclaw/openclaw.json")).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn candidate_launch_failure_preserves_the_executable_error() {
+    let root = TestDir::new("candidate-launch-permission");
+    let (cwd, env, env_root) = setup_named_runtime_candidate_fixture(&root);
+    let target = root.child("new-openclaw");
+    let script = recording_openclaw_script("new-openclaw").replacen(
+        "    echo \"Config valid\"",
+        "    chmod a-x \"$0\"\n    echo \"Config valid\"",
+        1,
+    );
+    write_executable_script(&target, &script);
+    let before = fs::read(env_root.join(".openclaw/openclaw.json")).unwrap();
+
+    let upgrade = run_ocm(
+        &cwd,
+        &env,
+        &["upgrade", "demo", "--runtime", "new-local", "--json"],
+    );
+    assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
+    let summary: Value = serde_json::from_str(&stdout(&upgrade)).unwrap();
+    let note = summary["note"].as_str().unwrap();
+    assert_eq!(summary["outcome"], "rolled-back", "{note}");
+    assert!(
+        note.contains("candidate managed Codex preflight failed to start"),
+        "{note}"
+    );
+    assert!(note.contains(&path_string(&target)), "{note}");
+    assert!(note.contains("Permission denied"), "{note}");
+    assert!(
+        note.contains("Resolve the reported executable, dependency, or permission error"),
+        "{note}"
+    );
+    assert!(!note.contains("Repair or reinstall"), "{note}");
+    assert_eq!(
+        fs::read(env_root.join(".openclaw/openclaw.json")).unwrap(),
+        before
+    );
+    let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
+    assert!(history.status.success(), "{}", stderr(&history));
+    let history: Value = serde_json::from_str(&stdout(&history)).unwrap();
+    assert_eq!(history[0]["migration"]["status"], "validated");
+    assert_eq!(history[0]["finalization"]["status"], "not-run");
+    assert!(history[0]["note"].is_null());
+}
+
+#[test]
+fn candidate_failure_identifies_previous_bytes_restored_at_the_same_name() {
+    let root = TestDir::new("candidate-restored-runtime");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let old_tarball = openclaw_package_tarball(&recording_openclaw_script("2026.8.1"), "2026.8.1");
+    let new_tarball = openclaw_package_tarball(&recording_openclaw_script("2026.8.2"), "2026.8.2");
+    let old_integrity = sha512_integrity(&old_tarball);
+    let new_integrity = sha512_integrity(&new_tarball);
+    let old_server =
+        TestHttpServer::serve_bytes_times("/old.tgz", "application/octet-stream", &old_tarball, 3);
+    let new_server =
+        TestHttpServer::serve_bytes_times("/new.tgz", "application/octet-stream", &new_tarball, 3);
+    let versions = serde_json::json!({
+        "2026.8.1": {"version":"2026.8.1", "dist":{"tarball":old_server.url(),"integrity":old_integrity}},
+        "2026.8.2": {"version":"2026.8.2", "dist":{"tarball":new_server.url(),"integrity":new_integrity}},
+    });
+    let packument =
+        |latest| {
+            serde_json::json!({
+        "dist-tags":{"latest":latest}, "versions":versions,
+        "time":{"2026.8.1":"2026-08-01T00:00:00.000Z","2026.8.2":"2026-08-02T00:00:00.000Z"},
+    }).to_string().into_bytes()
+        };
+    let registry = TestHttpServer::serve_bytes_sequence(
+        "/openclaw",
+        "application/json",
+        vec![
+            packument("2026.8.1"),
+            packument("2026.8.2"),
+            packument("2026.8.2"),
+        ],
+    );
+    let mut env = ocm_env(&root);
+    install_fake_node_and_npm(&root, &mut env, "22.22.3");
+    env.insert(
+        "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
+        registry.url(),
+    );
+    let start = run_ocm(&cwd, &env, &["start", "demo", "--no-service"]);
+    assert!(start.status.success(), "{}", stderr(&start));
+    let config = root.child("ocm-home/envs/demo/.openclaw/openclaw.json");
+    fs::write(&config, "{}\n").unwrap();
+    let runtime = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
+    assert!(runtime.status.success(), "{}", stderr(&runtime));
+    let runtime: Value = serde_json::from_str(&stdout(&runtime)).unwrap();
+    assert_eq!(runtime["releaseVersion"], "2026.8.1");
+    let entrypoint = PathBuf::from(runtime["installRoot"].as_str().unwrap())
+        .join("files/node_modules/openclaw/openclaw.mjs");
+    let old_bytes = fs::read(&entrypoint).unwrap();
+
+    env.insert("OCM_TEST_CODEX_PREFLIGHT".to_string(), "fail".to_string());
+    let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--json"]);
+    assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
+    let summary: Value = serde_json::from_str(&stdout(&upgrade)).unwrap();
+    let note = summary["note"].as_str().unwrap();
+    assert_eq!(summary["outcome"], "rolled-back", "{note}");
+    assert_eq!(summary["bindingName"], "stable");
+    assert_eq!(summary["runtimeReleaseVersion"], "2026.8.2");
+    assert!(note.contains("candidate hint before recovery: Repair or reinstall the staged OpenClaw package before cutover."), "{note}");
+    let recovery = note.split("OCM recovery result:").nth(1).unwrap();
+    assert!(
+        recovery.contains("The previous runtime was restored at \"stable\""),
+        "{note}"
+    );
+    assert!(!recovery.contains("Repair or reinstall"), "{note}");
+    assert!(recovery.contains("prepare a fresh candidate"), "{note}");
+    assert_eq!(fs::read(&entrypoint).unwrap(), old_bytes);
+    assert_eq!(fs::read_to_string(&config).unwrap(), "{}\n");
+    let runtime = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
+    assert!(runtime.status.success(), "{}", stderr(&runtime));
+    let runtime: Value = serde_json::from_str(&stdout(&runtime)).unwrap();
+    assert_eq!(runtime["releaseVersion"], "2026.8.1");
+    let version = run_ocm(&cwd, &env, &["@demo", "--", "--version"]);
+    assert!(version.status.success(), "{}", stderr(&version));
+    assert_eq!(stdout(&version).trim(), "2026.8.1");
+}
+
+#[test]
+fn candidate_batch_journal_keeps_bounded_redacted_notes_out_of_environment_history() {
+    for failure_policy in ["rollback", "continue"] {
+        let root = TestDir::new("candidate-batch-diagnostics");
+        let (cwd, env, _) = setup_named_runtime_candidate_fixture(&root);
+        let peer = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", "peer", "--runtime", "old-local"],
+        );
+        assert!(peer.status.success(), "{}", stderr(&peer));
+        fs::write(
+            root.child("ocm-home/envs/peer/.openclaw/openclaw.json"),
+            "{}\n",
+        )
+        .unwrap();
+        let finding = serde_json::json!({"findings":[{
+            "checkId":"codex/managed-app-server", "severity":"error",
+            "message":format!("Batch candidate cause token=private-token\n{}", "x".repeat(6_000)),
+            "path":"/candidate/codex", "fixHint":"Repair the staged candidate.",
+            "privateData":{"value":"unrelated-private-payload"},
+        }]})
+        .to_string();
+        let script = recording_openclaw_script("new-openclaw").replacen(
+            "#!/bin/sh\n",
+            &format!("#!/bin/sh\nif [ \"$1\" = doctor ] && [ \"$2\" = --lint ]; then\nprintf '%s\\n' '{finding}'\nexit 1\nfi\n"),
+            1,
+        );
+        write_executable_script(&root.child("new-openclaw"), &script);
+        let batch = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "upgrade",
+                "batch",
+                "--envs",
+                "demo,peer",
+                "--runtime",
+                "new-local",
+                "--failure-policy",
+                failure_policy,
+                "--accept-fleet-outage",
+                "--json",
+            ],
+        );
+        assert!(!batch.status.success(), "{}", stdout(&batch));
+        let summary: Value = serde_json::from_str(&stdout(&batch)).unwrap_or_else(|error| {
+            panic!(
+                "batch JSON failed: {error}; stdout: {}; stderr: {}",
+                stdout(&batch),
+                stderr(&batch)
+            )
+        });
+        assert_eq!(summary["outcome"], "partial");
+        assert_eq!(summary["results"].as_array().unwrap().len(), 2);
+        let note = summary["results"][0]["note"].as_str().unwrap();
+        assert!(
+            note.contains("Batch candidate cause token=<redacted>"),
+            "{note}"
+        );
+        assert!(note.contains("OCM recovery result:"), "{note}");
+        assert!(note.chars().count() <= 4_096);
+        assert!(note.lines().count() <= 12);
+        assert!(!note.contains("private-token"));
+        assert!(!note.contains("unrelated-private-payload"));
+        if failure_policy == "continue" {
+            assert!(
+                note.contains("failure policy left the gateway stopped for external recovery"),
+                "{note}"
+            );
+        }
+        let journal = fs::read_to_string(summary["journalPath"].as_str().unwrap()).unwrap();
+        assert!(!journal.contains("private-token"));
+        assert!(!journal.contains("unrelated-private-payload"));
+        let journal: Value = serde_json::from_str(&journal).unwrap();
+        assert_eq!(journal["results"][0]["note"], summary["results"][0]["note"]);
+
+        let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
+        assert!(history.status.success(), "{}", stderr(&history));
+        let history_text = stdout(&history);
+        assert!(!history_text.contains("Batch candidate cause"));
+        assert!(!history_text.contains("Repair the staged candidate"));
+        assert!(!history_text.contains("private-token"));
+        let history: Value = serde_json::from_str(&history_text).unwrap();
+        assert!(history[0]["note"].is_null());
+    }
 }
